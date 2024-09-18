@@ -32,11 +32,12 @@ fun replaceFileExtension(filePath: String, newExtension: String): String {
     return File(file.parent, newFileName).absolutePath
 }
 
-fun hmacSha256Digest(key:ByteArray,data:ByteArray):ByteArray{
+fun hmacSha256Digest(key:ByteArray,data:ByteArray,offset:Int,length:Int):ByteArray{
     val keySpec=SecretKeySpec(key,"HmacSHA256")
     val mac=Mac.getInstance("HmacSHA256")
     mac.init(keySpec)
-    return mac.doFinal(data)
+    mac.update(data,offset,length)
+    return mac.doFinal()
 }
 
 fun aesCbcDecrypt(key:ByteArray,data:ByteArray,iv:ByteArray):ByteArray{
@@ -47,21 +48,20 @@ fun aesCbcDecrypt(key:ByteArray,data:ByteArray,iv:ByteArray):ByteArray{
     return cipher.doFinal(data)
 }
 
-fun generateKey(nonce:ByteArray):ByteArray{
-    val key=ByteArray(16)
+fun generateKey(nonce:ByteArray,result :ByteArray):ByteArray{
     var tmp=nonce
     for(i in 0 until 50000)
     {
-        tmp=hmacSha256Digest(HMACKEY,tmp)
+        tmp=hmacSha256Digest(HMACKEY,tmp,0,tmp.size)
         for(j in 0 until 16)
-            key[j]=key[j].xor(tmp[j])
+            result[j]=result[j].xor(tmp[j])
     }
-    return key
+    return result
 }
 
 
 class DecryptResult(val contentElement:Element, val content:String)
-fun decryptNote(input:String):String{
+suspend fun decryptNote(input:String):String{
     val encryptedData=Base64.getMimeDecoder().decode(input)
     return ByteArrayInputStream(encryptedData).use { s1 ->
         val signature = ByteArray(4)
@@ -71,22 +71,36 @@ fun decryptNote(input:String):String{
         val nonce1 = ByteArray(20)
         s1.read(nonce1, 0, 16)
         nonce1[19] = 1
-        val key1 = generateKey(nonce1)
         val nonce2 = ByteArray(20)
-        nonce2[19] = 1
         s1.read(nonce2, 0, 16)
-        val key2=generateKey(nonce2)
+        nonce2[19] = 1
         val iv = ByteArray(16)
         s1.read(iv)
+        val key1=ByteArray(16)
+        val key2=ByteArray(16)
+        coroutineScope {
+            launch {
+                generateKey(nonce1,key1)
+            }
+            launch {
+                generateKey(nonce2,key2)
+            }
+        }
         val dataLength = encryptedData.size - 16 * 5 - 4
         val data = ByteArray(dataLength)
-        s1.read(data)
-        val hash = ByteArray(32)
-        s1.read(hash)
-        if(!hmacSha256Digest(key2,encryptedData.copyOfRange(0,encryptedData.size-32)).contentEquals(hash))
-            throw DataFormatException("Hash verification failed")
-        val decryptedData = aesCbcDecrypt(key1, data, iv)
-        String(decryptedData.copyOfRange(0, decryptedData.size - 1), StandardCharsets.UTF_8)
+        coroutineScope {
+            launch {
+                s1.read(data)
+                val hash = ByteArray(32)
+                s1.read(hash)
+                if(!hmacSha256Digest(key2,encryptedData,0,encryptedData.size-32).contentEquals(hash))
+                    throw Exception("Hash verification failed")
+            }
+        }
+        coroutineScope {
+            val decryptedData = aesCbcDecrypt(key1, data, iv)
+            String(decryptedData,0,decryptedData.size - 1, StandardCharsets.UTF_8)
+        }
     }
 }
 
@@ -148,6 +162,7 @@ fun main(args:Array<String>){
         if(!file.exists()){
             println("Path ${file.absolutePath} not exists")
             return
+            
         }
         if(!outputDirectory.exists())
             outputDirectory.mkdirs()
